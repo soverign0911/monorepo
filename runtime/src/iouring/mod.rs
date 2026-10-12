@@ -67,6 +67,15 @@
 //! though dedicated and blocking tasks may still run and find a pool worker
 //! closed. Native thread-local destructors may run after the runner returns.
 //!
+//! # Testing
+//!
+//! Most submodules have unit tests beside their code. The runtime tests in
+//! `tests.rs` run whole runners and hook a worker's startup, turns, parks,
+//! overflows, and shutdown to force races. Loom models check the worker wake
+//! source in `waker.rs`, the task set in `tasks.rs`, task state and the pool's
+//! search and park protocol in `task.rs`, and the run queue in `queue.rs`. The
+//! tests of `task.rs`, `tasks.rs`, and `queue.rs` also run under Miri.
+//!
 //! # Examples
 //!
 //! ```no_run
