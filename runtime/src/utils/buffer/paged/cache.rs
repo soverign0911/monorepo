@@ -6,6 +6,8 @@ use super::{
 };
 use crate::{BLOB_PAGE_SIZE, Blob, BufferPool, BufferPooler, Error, IoBuf, IoBufMut, ReadOptions};
 use ahash::AHashMap;
+#[commonware_macros::stability(ALPHA)]
+use commonware_utils::sync::RwLockWriteGuard;
 use commonware_utils::{
     Widen, cache,
     channel::oneshot,
@@ -66,6 +68,17 @@ type Insert = fn(&mut Cache, u64, &[u8], u64);
 /// lock to waiting readers, bounding how long a warm of any size delays them.
 #[commonware_macros::stability(ALPHA)]
 const WARM_LOCK_PAGES: usize = 64;
+
+/// The outcome of one pass of [CacheRef::warm].
+#[commonware_macros::stability(ALPHA)]
+struct WarmPass {
+    /// Count of pages the pass read from the blob.
+    read: usize,
+    /// Pages a joined batch withdrew, which the next pass reads.
+    withdrawn: Vec<u64>,
+    /// The first error the pass met. Every other page is still cached.
+    result: Result<(), Error>,
+}
 
 /// Readers waiting on one page of an in-flight batched read.
 struct BatchJoin {
@@ -769,39 +782,34 @@ impl CacheRef {
         blob_id: u64,
         page_nums: &[u64],
     ) -> Result<usize, Error> {
-        let mut count = 0;
-        let mut result = Ok(());
-        let mut retry = self
-            .warm_pages(blob, blob_id, page_nums, &mut count, &mut result)
-            .await;
-        while !retry.is_empty() {
-            retry.sort_unstable();
-            retry = self
-                .warm_pages(blob, blob_id, &retry, &mut count, &mut result)
-                .await;
+        let mut pass = self.warm_pages(blob, blob_id, page_nums).await;
+        let mut read = pass.read;
+        let mut result = pass.result;
+        while !pass.withdrawn.is_empty() {
+            let mut withdrawn = pass.withdrawn;
+            withdrawn.sort_unstable();
+            pass = self.warm_pages(blob, blob_id, &withdrawn).await;
+            read += pass.read;
+            result = result.and(pass.result);
         }
-        result.map(|()| count)
+        result.map(|()| read)
     }
 
-    /// One pass of [Self::warm] over `page_nums` (strictly increasing), adding the pages it reads
-    /// to `count` and recording the first error in `result`. Returns the pages a joined batch
-    /// withdrew, which the next pass reads.
+    /// One pass of [Self::warm] over `page_nums` (strictly increasing).
     #[commonware_macros::stability(ALPHA)]
     async fn warm_pages<B: Blob>(
         &self,
         blob: &Arc<B>,
         blob_id: u64,
         page_nums: &[u64],
-        count: &mut usize,
-        result: &mut Result<(), Error>,
-    ) -> Vec<u64> {
+    ) -> WarmPass {
         let mut pages = Vec::with_capacity(page_nums.len());
         let mut joined = Vec::new();
         {
             let mut guard = self.cache.write();
             for (chunk_index, chunk) in page_nums.chunks(WARM_LOCK_PAGES).enumerate() {
                 if chunk_index > 0 {
-                    commonware_utils::sync::RwLockWriteGuard::bump(&mut guard);
+                    RwLockWriteGuard::bump(&mut guard);
                 }
                 let cache = &mut *guard;
                 for &page_num in chunk {
@@ -858,23 +866,20 @@ impl CacheRef {
             while let Some((page_num, fetch)) = joins.next().await {
                 match fetch {
                     Some(Ok(_)) => {}
-                    Some(Err(err)) => {
-                        if result.is_ok() {
-                            result = Err(err);
-                        }
-                    }
+                    Some(Err(err)) => result = result.and(Err(err)),
                     None => withdrawn.push(page_num),
                 }
             }
             (withdrawn, result)
         };
-        *count += pages.len();
-        let read = self.warm_read(blob, blob_id, pages);
-        let ((withdrawn, joined), read) = futures::join!(joined, read);
-        if result.is_ok() {
-            *result = read.and(joined);
+        let read = pages.len();
+        let ((withdrawn, joined), result) =
+            futures::join!(joined, self.warm_read(blob, blob_id, pages));
+        WarmPass {
+            read,
+            withdrawn,
+            result: result.and(joined),
         }
-        withdrawn
     }
 
     /// Read `pages` (strictly increasing) of `blob` with one registered batched read, caching
@@ -891,15 +896,8 @@ impl CacheRef {
         }
         let (driver, output) = self.read_batch(blob, blob_id, pages, Cache::cache_expected)?;
         driver.await;
-        let mut result = Ok(());
-        for item in output.lock().drain(..) {
-            if let Err(err) = item
-                && result.is_ok()
-            {
-                result = Err(err);
-            }
-        }
-        result
+        let output = std::mem::take(&mut *output.lock());
+        output.into_iter().try_for_each(|item| item.map(drop))
     }
 
     /// Start a batched read of `pages` (non-empty, strictly increasing) of `blob`, registered so
