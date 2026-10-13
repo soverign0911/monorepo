@@ -760,7 +760,8 @@ impl CacheRef {
     }
 
     /// Read pages `page_nums` (strictly increasing) of `blob` into the cache ahead of their first
-    /// request, returning how many were read.
+    /// request. On success, returns the number of pages this call read from the blob, which
+    /// excludes resident pages and pages joined from another reader's fetch.
     ///
     /// Resident pages are marked expected without recording use (see [cache::Cache::expect]), and
     /// pages another reader is fetching, alone or in a batch, are joined and cached as expected
