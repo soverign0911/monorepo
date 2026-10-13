@@ -1169,7 +1169,7 @@ impl Local {
         // Only this worker pushes and pops, while the pool keeps the shared
         // end for thieves.
         let ready = match role {
-            Role::Pool(index) => Some(Ready::new(shared.pool.ring(index).owner())),
+            Role::Pool(index) => Some(Ready::new(shared.pool.queue(index).owner())),
             Role::Dedicated => None,
         };
         Ok(Self {
