@@ -2841,6 +2841,45 @@ mod tests {
     }
 
     #[test_traced]
+    fn test_read_joining_unpolled_warm_completes() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            const PAGES: usize = 2;
+            let (blob, mut opens) = gated_blob(PAGES);
+            let cache_ref = CacheRef::from_pooler(&context, PAGE_SIZE, NZUsize!(16));
+
+            // A warm of both pages starts its read, then is retained without being polled while
+            // its pages arrive.
+            let view = full_view(&blob, &cache_ref, 0, PAGES as u64);
+            let mut warm = Box::pin(view.warm(&[(0, 2 * PAGE_SIZE_U64)]));
+            assert!(poll!(warm.as_mut()).is_pending());
+            assert_eq!(blob.reads.lock().len(), PAGES);
+            for open in &mut opens {
+                open.take().unwrap().send(()).unwrap();
+            }
+
+            // A read of page 1 joins the warm and completes without reading the page again.
+            let mut page = [0u8; 1];
+            select! {
+                result = cache_ref.read_after_miss(&blob, 0, &mut page, PAGE_SIZE_U64) => {
+                    result.unwrap();
+                },
+                _ = context.sleep(Duration::from_secs(1)) => {
+                    panic!("read joining an unpolled warm did not complete");
+                },
+            }
+            assert_eq!(page, [1]);
+            assert_eq!(blob.reads.lock().len(), PAGES);
+
+            // The warm completes from the pages already read.
+            assert_eq!(warm.await.unwrap(), PAGES);
+            assert_eq!(blob.reads.lock().len(), PAGES);
+            assert!(cache_ref.cache.read().page_fetches.is_empty());
+            assert!(cache_ref.cache.read().batches.is_empty());
+        });
+    }
+
+    #[test_traced]
     fn test_read_many_into_joins_fetch_in_flight() {
         let executor = deterministic::Runner::default();
         executor.start(|context| async move {
