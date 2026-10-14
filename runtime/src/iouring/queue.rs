@@ -104,7 +104,8 @@
 //! as the `miri` test group, which covers the module's unsafe slot accesses.
 //! The loom models in `loom_tests` run real queues of capacity four, with loom
 //! cells tracking every slot access, through pops, overflows and steals, some
-//! across the wrapping position. The pool's tests pause claims the same way.
+//! across the wrapping position. The tests of the pool and of its idle state
+//! pause claims the same way.
 
 use super::task::UnsafeCell;
 use crossbeam_utils::CachePadded;
