@@ -822,14 +822,16 @@ impl Runnable {
         // inside one can take it here. A closing worker polls nothing more,
         // so its wakes go to the global queue, which runs them elsewhere or
         // has closed.
-        if let Some(local) = Local::serving(self.0.owner) {
-            let mut local = local.borrow_mut();
-            if !local.closing {
-                local.enqueue(self);
-                return;
+        let owner = self.0.owner;
+        let mut runnable = Some(self);
+        Local::with_serving(owner, |local| {
+            if let Some(runnable) = runnable.take() {
+                local.enqueue(runnable);
             }
+        });
+        if let Some(runnable) = runnable {
+            runnable.push_global();
         }
-        self.push_global();
     }
 
     /// Deliver a new task's first runnable. A worker of the task's pool that
@@ -838,14 +840,18 @@ impl Runnable {
     /// worker to start it. Even local delivery can export overflow through
     /// [`Pool::enqueue`]. The caller must hold no Local borrow.
     pub fn spawn(self) {
-        if let Some(local) = Local::serving(self.0.owner) {
-            let mut local = local.borrow_mut();
-            if !local.closing && (local.ready().is_empty() || local.workers() == 1) {
-                local.enqueue(self);
-                return;
+        let owner = self.0.owner;
+        let mut runnable = Some(self);
+        Local::with_serving(owner, |local| {
+            if (local.ready().is_empty() || local.workers() == 1)
+                && let Some(runnable) = runnable.take()
+            {
+                local.enqueue(runnable);
             }
+        });
+        if let Some(runnable) = runnable {
+            runnable.push_global();
         }
-        self.push_global();
     }
 
     /// Push the runnable into its pool's global queue.

@@ -1209,13 +1209,23 @@ impl Local {
         matches.then_some(local)
     }
 
-    /// Return the current worker if it polls tasks retained by `owner`,
-    /// including during shutdown.
-    #[inline(always)]
-    pub fn serving(owner: NonZeroU64) -> Option<Rc<RefCell<Self>>> {
-        let local = Self::current()?;
-        let serves = local.borrow().serving == Some(owner);
-        serves.then_some(local)
+    /// Run `f` on the worker installed on this thread if it polls tasks
+    /// retained by `owner` and is not closing, and do nothing otherwise,
+    /// including when no worker is installed or its TLS key has been
+    /// destroyed. The worker is borrowed in place rather than through a clone
+    /// of its handle, so the caller must hold no Local borrow, and `f` must
+    /// run no user code.
+    #[inline]
+    pub fn with_serving(owner: NonZeroU64, f: impl FnOnce(&mut Self)) {
+        // Escaped wakers can run from native TLS destructors after this key is gone.
+        let _ = CURRENT.try_with(|current| {
+            if let Some(local) = current.borrow().as_ref() {
+                let mut local = local.borrow_mut();
+                if local.serving == Some(owner) && !local.closing {
+                    f(&mut local);
+                }
+            }
+        });
     }
 
     /// Workers in this worker's pool.
