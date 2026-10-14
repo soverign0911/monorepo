@@ -90,6 +90,7 @@
 //! ```
 
 mod driver;
+mod idle;
 mod mailbox;
 pub(crate) mod operation;
 mod pool;

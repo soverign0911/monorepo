@@ -2055,7 +2055,7 @@ mod loom_tests {
         AfterPending, AfterPoll, Mailbox, Panics, Pool, REF_ONE, REFS, Ready, Runnable, State,
         Task, Tasks,
     };
-    use crate::iouring::{pool::Searcher, queue::STEALABLE};
+    use crate::iouring::{idle::Searcher, queue::STEALABLE};
     use loom::{
         sync::{
             Arc, Condvar, Mutex,
@@ -2439,7 +2439,7 @@ mod loom_tests {
     /// Exiting after idle publication, racing a foreign claim, leaves no idle
     /// bit or search count. Pool destruction checks both are restored.
     #[test]
-    fn test_exit_racing_a_claim_restores_the_wake_word() {
+    fn test_exit_racing_a_claim_restores_the_idle_state() {
         loom::model(|| {
             let pool = pool(2);
             let set = Tasks::new(2);
