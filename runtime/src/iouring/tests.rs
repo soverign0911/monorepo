@@ -3707,8 +3707,9 @@ fn test_wake_from_another_runtime_stays_in_its_own_pool() {
     assert_ne!(before, sender);
 }
 
-/// A dedicated worker wakes an idle ordinary task through the pool's global
-/// queue, since the dedicated worker has no run queue of its own.
+/// An ordinary task woken from a dedicated worker, which has no run queue of
+/// its own, runs on a pool worker rather than on the dedicated thread, with
+/// one pool worker and with two.
 #[test]
 fn test_wake_from_a_dedicated_worker_goes_to_the_pool() {
     for workers in [1, 2] {
