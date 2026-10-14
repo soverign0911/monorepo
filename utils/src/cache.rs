@@ -288,15 +288,17 @@ impl<K: Hash + Eq, V> Cache<K, V> {
         (slot, &mut self.slots[slot].value)
     }
 
-    /// Like [`Self::get_or_insert_mut`], except that a miss displaces `stale` when it is
-    /// resident: `key` takes over `stale`'s slot and value, entering `stale`'s partition as a
-    /// fresh admission. Use this when the caller knows `stale` is worthless: it costs one lookup
-    /// of `stale` instead of the replacement policy's victim search and Ghost bookkeeping. A miss
-    /// with `stale` absent is served by the policy as usual.
+    /// Like [`Self::get_or_insert_mut`], except that a miss displaces the first resident among
+    /// `stale`: `key` takes over that resident's slot and value, entering its partition as a
+    /// fresh admission. Use this when the caller knows the keys in `stale` are worthless: each
+    /// costs one lookup instead of the replacement policy's victim search and Ghost bookkeeping.
+    /// `stale` is advanced only on a miss and only until a resident is found, so the caller
+    /// bounds the lookups by bounding `stale`. A miss with no resident in `stale` is served by
+    /// the policy as usual.
     pub fn get_or_insert_mut_displacing<F: FnOnce() -> V>(
         &mut self,
         key: K,
-        stale: &K,
+        stale: impl IntoIterator<Item = K>,
         make: F,
     ) -> (usize, &mut V) {
         let hash = self.hasher.hash_one(&key);
@@ -304,15 +306,21 @@ impl<K: Hash + Eq, V> Cache<K, V> {
             self.slots[slot].state.record_hit_mut();
             return (slot, &mut self.slots[slot].value);
         }
-        let stale_hash = self.hasher.hash_one(stale);
-        let Ok(entry) = self
-            .index
-            .find_entry(stale_hash, |&slot| self.slots[slot].key == *stale)
-        else {
+        let mut found = None;
+        for stale in stale {
+            let stale_hash = self.hasher.hash_one(&stale);
+            if let Ok(entry) = self
+                .index
+                .find_entry(stale_hash, |&slot| self.slots[slot].key == stale)
+            {
+                found = Some(entry.remove().0);
+                break;
+            }
+        }
+        let Some(slot) = found else {
             let slot = self.insert(key, hash, None, make);
             return (slot, &mut self.slots[slot].value);
         };
-        let slot = entry.remove().0;
 
         // Residents never have Ghost history, and the displaced key earns none.
         self.ghost.discard(&key, hash);
@@ -1298,7 +1306,7 @@ mod tests {
         assert!(main_before.contains(&5));
         assert_eq!(cache.ghost_keys(), Vec::<u64>::new());
 
-        let (slot, value) = cache.get_or_insert_mut_displacing(100, &5, || 0);
+        let (slot, value) = cache.get_or_insert_mut_displacing(100, [5], || 0);
         assert_eq!(slot, stale_slot);
         assert_eq!(*value, 50, "the stale value is handed back for overwriting");
         *value = 1000;
@@ -1327,7 +1335,7 @@ mod tests {
         }
 
         // A resident key is a hit regardless of the stale key offered.
-        let (slot, value) = cache.get_or_insert_mut_displacing(7, &3, || 0);
+        let (slot, value) = cache.get_or_insert_mut_displacing(7, [3], || 0);
         assert_eq!(*value, 7);
         assert_eq!(slot, cache.find_slot(&7).unwrap());
         assert!(cache.contains(&3));
@@ -1337,11 +1345,41 @@ mod tests {
         // Small tail (key 36, the oldest probationary resident).
         let small_tail = *cache.small_keys().last().unwrap();
         assert!(!cache.contains(&999));
-        cache.get_or_insert_mut_displacing(100, &999, || 100);
+        cache.get_or_insert_mut_displacing(100, [999], || 100);
         assert!(cache.contains(&100));
         assert!(!cache.contains(&small_tail));
         assert_eq!(cache.ghost_keys(), vec![small_tail]);
         assert_eq!(cache.len(), 40);
+        cache.check_invariants();
+    }
+
+    #[test]
+    fn test_displacing_insert_skips_absent_candidates() {
+        // Absent candidates cost one lookup each and are skipped, so a later resident one is
+        // still displaced rather than a live resident evicted. The search stops at the first
+        // resident, and a hit consumes no candidates.
+        let mut cache = Cache::new(NZUsize!(40));
+        for key in 0..40u64 {
+            cache.put(key, key);
+        }
+        let stale_slot = cache.find_slot(&5).unwrap();
+
+        let mut candidates = [998u64, 999, 5, 6].into_iter();
+        cache.get_or_insert_mut_displacing(100, candidates.by_ref(), || 0);
+        assert_eq!(cache.find_slot(&100), Some(stale_slot));
+        assert!(!cache.contains(&5));
+        assert_eq!(cache.len(), 40);
+        assert_eq!(
+            cache.ghost_keys(),
+            Vec::<u64>::new(),
+            "no live resident was evicted"
+        );
+        assert_eq!(candidates.next(), Some(6));
+
+        let mut candidates = [6u64].into_iter();
+        cache.get_or_insert_mut_displacing(100, candidates.by_ref(), || 0);
+        assert_eq!(candidates.next(), Some(6));
+        assert!(cache.contains(&6));
         cache.check_invariants();
     }
 
@@ -1374,7 +1412,7 @@ mod tests {
         );
         assert!(cache.get(&hand).is_some());
 
-        cache.get_or_insert_mut_displacing(ghosted, &hand, || ghosted);
+        cache.get_or_insert_mut_displacing(ghosted, [hand], || ghosted);
         let slot = cache.find_slot(&ghosted).unwrap();
         assert!(!cache.slots[slot].state.take_reference());
         assert!(!cache.ghost_keys().contains(&ghosted));

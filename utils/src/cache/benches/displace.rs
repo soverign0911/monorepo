@@ -55,7 +55,7 @@ fn bench_displace(c: &mut Criterion) {
                                 match stale {
                                     Some(stale) => cache.get_or_insert_mut_displacing(
                                         black_box(key),
-                                        black_box(&stale),
+                                        [black_box(stale)],
                                         || key,
                                     ),
                                     None => cache.get_or_insert_mut(black_box(key), || key),

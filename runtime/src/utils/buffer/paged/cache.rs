@@ -133,9 +133,14 @@ struct Cache {
     page_fetches: AHashMap<(u64, u64), PageFetchEntry>,
 
     /// Pages retired by [CacheRef::retire] whose slots have not been reclaimed yet, as
-    /// `(blob id, page numbers)` in retirement order. Each insertion reclaims the oldest one.
+    /// `(blob id, page numbers)` in retirement order. Each insertion reclaims the oldest one
+    /// still resident.
     retired: VecDeque<(u64, Range<u64>)>,
 }
+
+/// The most retired pages one insertion inspects for a resident to displace. Retired pages that
+/// already left the cache are skipped, so a few of them do not cost a live page its slot.
+const MAX_RETIRED_PROBES: usize = 8;
 
 /// A reference to a page cache that can be shared across threads via cloning, along with the page
 /// size that will be used with it. Provides the API for interacting with the page cache in a
@@ -553,9 +558,9 @@ impl CacheRef {
     /// `range.start`.
     ///
     /// Retiring declares that the pages will not be read again soon. A retired page stays
-    /// readable while it is resident, but each later insertion displaces the oldest retired
-    /// page, if still resident, instead of a live resident, so retired pages leave the cache at
-    /// the rate new pages arrive. Retiring itself does no per-page work.
+    /// readable while it is resident, but each later insertion displaces the oldest retired page
+    /// still resident instead of a live resident, so retired pages leave the cache at the rate
+    /// new pages arrive. Retiring itself does no per-page work.
     pub(super) fn retire(&self, blob_id: u64, range: Range<u64>, size: u64) {
         let page_size: u64 = self.page_size.widen();
         let first = range.start / page_size;
@@ -629,19 +634,19 @@ impl Cache {
 
     /// Put the given `page` into the page cache and record its slot hint.
     ///
-    /// A new page displaces the oldest retired page (see [CacheRef::retire]) when that page is
-    /// still resident, taking over its slot rather than one freed by the replacement policy.
+    /// A new page displaces the oldest retired page still resident (see [CacheRef::retire]),
+    /// taking over its slot rather than one freed by the replacement policy. Retired pages that
+    /// already left the cache are skipped, up to [MAX_RETIRED_PROBES] per insertion.
     fn cache(&mut self, blob_id: u64, page: &[u8], page_num: u64) {
         let page_size: usize = self.page_size.widen();
         assert_eq!(page.len(), page_size);
         let key = (blob_id, page_num);
-        let retired = self.next_retired();
         let pool = &self.pool;
-        let make = || pool.alloc_zeroed(page_size);
-        let (slot, buf) = match retired {
-            Some(retired) => self.cache.get_or_insert_mut_displacing(key, &retired, make),
-            None => self.cache.get_or_insert_mut(key, make),
-        };
+        let retired = &mut self.retired;
+        let stale = core::iter::from_fn(|| next_retired(retired)).take(MAX_RETIRED_PROBES);
+        let (slot, buf) = self
+            .cache
+            .get_or_insert_mut_displacing(key, stale, || pool.alloc_zeroed(page_size));
         buf.as_mut().copy_from_slice(page);
         let hint = self.hint_index(blob_id, page_num);
         self.hints[hint] = slot;
@@ -658,17 +663,6 @@ impl Cache {
             return;
         }
         self.retired.push_back((blob_id, pages));
-    }
-
-    /// Take the oldest retired page, if any.
-    fn next_retired(&mut self) -> Option<(u64, u64)> {
-        let (blob_id, pages) = self.retired.front_mut()?;
-        let retired = (*blob_id, pages.start);
-        pages.start += 1;
-        if pages.is_empty() {
-            self.retired.pop_front();
-        }
-        Some(retired)
     }
 
     /// The hint slot for `(blob_id, page_num)`: the page number offset by a per-blob salt,
@@ -735,6 +729,17 @@ fn cacheable_page(page: IoBuf, page_num: u64, page_size: NonZeroU16) -> Result<I
         return Err(Error::InvalidChecksum);
     }
     Ok(page)
+}
+
+/// Take the oldest page in `retired`, if any.
+fn next_retired(retired: &mut VecDeque<(u64, Range<u64>)>) -> Option<(u64, u64)> {
+    let (blob_id, pages) = retired.front_mut()?;
+    let page = (*blob_id, pages.start);
+    pages.start += 1;
+    if pages.is_empty() {
+        retired.pop_front();
+    }
+    Some(page)
 }
 
 #[cfg(test)]
@@ -1027,6 +1032,33 @@ mod tests {
         assert!(cache_ref.cache.read().retired.is_empty());
         cache_ref.cache(blob_id, &vec![4; page_size], 4 * PAGE_SIZE_U64);
         assert!((2..5).all(cached));
+    }
+
+    #[test_traced]
+    fn test_retire_skips_absent_pages_to_spare_live_ones() {
+        // An insertion skips retired pages that already left the cache, so it still takes the
+        // slot of a later retired page that is resident instead of evicting a live page.
+        let pool = test_pool();
+        let cache_ref = CacheRef::new(pool, PAGE_SIZE, NZUsize!(4));
+        let blob_id = cache_ref.next_id();
+        let page_size = PAGE_SIZE.get() as usize;
+        let cached = |page: u64| {
+            let mut buf = vec![0u8; page_size];
+            cache_ref.read_cached(blob_id, &mut buf, page * PAGE_SIZE_U64) == page_size
+        };
+
+        // Fill the cache with pages 2..6, then retire pages 0..3, of which only page 2 is
+        // resident.
+        for page in 2..6u64 {
+            cache_ref.cache(blob_id, &vec![page as u8; page_size], page * PAGE_SIZE_U64);
+        }
+        cache_ref.retire(blob_id, 0..3 * PAGE_SIZE_U64, 8 * PAGE_SIZE_U64);
+
+        // The insertion skips pages 0 and 1 and displaces page 2, leaving every live page.
+        cache_ref.cache(blob_id, &vec![6; page_size], 6 * PAGE_SIZE_U64);
+        assert!(!cached(2));
+        assert!((3..7).all(cached));
+        assert!(cache_ref.cache.read().retired.is_empty());
     }
 
     #[test_traced]
