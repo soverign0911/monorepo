@@ -132,15 +132,68 @@ struct Cache {
     /// fetch a specific page.
     page_fetches: AHashMap<(u64, u64), PageFetchEntry>,
 
-    /// Pages retired by [CacheRef::retire] whose slots have not been reclaimed yet, as
-    /// `(blob id, page numbers)` in retirement order. Each insertion reclaims the oldest one
-    /// still resident.
-    retired: VecDeque<(u64, Range<u64>)>,
+    /// Pages retired by [CacheRef::retire] whose slots have not been reclaimed yet. Each
+    /// insertion reclaims the oldest one still resident.
+    retired: Retired,
 }
 
 /// The most retired pages one insertion inspects for a resident to displace. Retired pages that
-/// already left the cache are skipped, so a few of them do not cost a live page its slot.
+/// already left the cache are skipped, so a few of them do not cost a live page its slot. Each
+/// queued page is inspected at most once, so the bound limits one insertion's work without
+/// changing the total.
 const MAX_RETIRED_PROBES: usize = 8;
+
+/// Retired pages as `(blob id, page numbers)` ranges in retirement order, holding at most a
+/// limit's worth of pages.
+#[derive(Default)]
+struct Retired {
+    ranges: VecDeque<(u64, Range<u64>)>,
+
+    /// Total pages across `ranges`.
+    pages: u64,
+}
+
+impl Retired {
+    /// Queue `pages` of blob `blob_id`, extending the newest range when the pages continue it,
+    /// then drop the oldest queued pages beyond `limit`.
+    fn push(&mut self, blob_id: u64, pages: Range<u64>, limit: u64) {
+        self.pages += pages.end - pages.start;
+        if let Some((last_blob, last)) = self.ranges.back_mut()
+            && *last_blob == blob_id
+            && last.end == pages.start
+        {
+            last.end = pages.end;
+        } else {
+            self.ranges.push_back((blob_id, pages));
+        }
+        while self.pages > limit {
+            let excess = self.pages - limit;
+            let Some((_, front)) = self.ranges.front_mut() else {
+                break;
+            };
+            let len = front.end - front.start;
+            if len > excess {
+                front.start += excess;
+                self.pages -= excess;
+            } else {
+                self.pages -= len;
+                self.ranges.pop_front();
+            }
+        }
+    }
+
+    /// Take the oldest retired page, if any.
+    fn pop(&mut self) -> Option<(u64, u64)> {
+        let (blob_id, pages) = self.ranges.front_mut()?;
+        let page = (*blob_id, pages.start);
+        pages.start += 1;
+        self.pages -= 1;
+        if pages.is_empty() {
+            self.ranges.pop_front();
+        }
+        Some(page)
+    }
+}
 
 /// A reference to a page cache that can be shared across threads via cloning, along with the page
 /// size that will be used with it. Provides the API for interacting with the page cache in a
@@ -558,9 +611,14 @@ impl CacheRef {
     /// `range.start`.
     ///
     /// Retiring declares that the pages will not be read again soon. A retired page stays
-    /// readable while it is resident, but each later insertion displaces the oldest retired page
-    /// still resident instead of a live resident, so retired pages leave the cache at the rate
-    /// new pages arrive. Retiring itself does no per-page work.
+    /// readable while it is resident. Each later insertion takes the slot of the oldest retired
+    /// page still resident, so retired pages leave the cache at about the rate new pages arrive.
+    /// An insertion inspects at most [MAX_RETIRED_PROBES] retired pages: when all of them already
+    /// left the cache, it falls back to ordinary replacement, which may evict a live page while
+    /// later retired pages remain resident. At most the cache's capacity in retired pages stays
+    /// queued, since no more can be resident; the oldest beyond that are dropped from the queue,
+    /// and any of them still resident leave by ordinary replacement. Retiring itself does no
+    /// per-page work.
     pub(super) fn retire(&self, blob_id: u64, range: Range<u64>, size: u64) {
         let page_size: u64 = self.page_size.widen();
         let first = range.start / page_size;
@@ -593,7 +651,7 @@ impl Cache {
             page_size,
             pool,
             page_fetches: AHashMap::new(),
-            retired: VecDeque::new(),
+            retired: Retired::default(),
         }
     }
 
@@ -643,7 +701,7 @@ impl Cache {
         let key = (blob_id, page_num);
         let pool = &self.pool;
         let retired = &mut self.retired;
-        let stale = core::iter::from_fn(|| next_retired(retired)).take(MAX_RETIRED_PROBES);
+        let stale = core::iter::from_fn(|| retired.pop()).take(MAX_RETIRED_PROBES);
         let (slot, buf) = self
             .cache
             .get_or_insert_mut_displacing(key, stale, || pool.alloc_zeroed(page_size));
@@ -652,17 +710,11 @@ impl Cache {
         self.hints[hint] = slot;
     }
 
-    /// Queue `pages` of blob `blob_id` for reclamation, extending the newest range when the
-    /// pages continue it.
+    /// Queue `pages` of blob `blob_id` for reclamation, keeping at most the cache's capacity in
+    /// pages queued.
     fn retire(&mut self, blob_id: u64, pages: Range<u64>) {
-        if let Some((last_blob, last)) = self.retired.back_mut()
-            && *last_blob == blob_id
-            && last.end == pages.start
-        {
-            last.end = pages.end;
-            return;
-        }
-        self.retired.push_back((blob_id, pages));
+        let limit = self.cache.capacity() as u64;
+        self.retired.push(blob_id, pages, limit);
     }
 
     /// The hint slot for `(blob_id, page_num)`: the page number offset by a per-blob salt,
@@ -695,7 +747,7 @@ impl Cache {
     fn clear(&mut self) {
         self.cache.retain(|_, _| false);
         self.page_fetches.clear();
-        self.retired.clear();
+        self.retired = Retired::default();
     }
 }
 
@@ -729,17 +781,6 @@ fn cacheable_page(page: IoBuf, page_num: u64, page_size: NonZeroU16) -> Result<I
         return Err(Error::InvalidChecksum);
     }
     Ok(page)
-}
-
-/// Take the oldest page in `retired`, if any.
-fn next_retired(retired: &mut VecDeque<(u64, Range<u64>)>) -> Option<(u64, u64)> {
-    let (blob_id, pages) = retired.front_mut()?;
-    let page = (*blob_id, pages.start);
-    pages.start += 1;
-    if pages.is_empty() {
-        retired.pop_front();
-    }
-    Some(page)
 }
 
 #[cfg(test)]
@@ -1022,14 +1063,14 @@ mod tests {
         // pages 0 and 1 even though the byte range extends far beyond the blob.
         cache_ref.cache(blob_id, &vec![0; page_size], 0);
         cache_ref.retire(blob_id, 0..u64::MAX, 2 * PAGE_SIZE_U64);
-        assert_eq!(cache_ref.cache.read().retired, [(blob_id, 0..2)]);
+        assert_eq!(cache_ref.cache.read().retired.ranges, [(blob_id, 0..2)]);
 
         // The first insertion reclaims page 0; the second finds page 1 absent and inserts
         // normally; the third has nothing left to reclaim.
         cache_ref.cache(blob_id, &vec![2; page_size], 2 * PAGE_SIZE_U64);
         assert!(!cached(0));
         cache_ref.cache(blob_id, &vec![3; page_size], 3 * PAGE_SIZE_U64);
-        assert!(cache_ref.cache.read().retired.is_empty());
+        assert!(cache_ref.cache.read().retired.ranges.is_empty());
         cache_ref.cache(blob_id, &vec![4; page_size], 4 * PAGE_SIZE_U64);
         assert!((2..5).all(cached));
     }
@@ -1058,7 +1099,7 @@ mod tests {
         cache_ref.cache(blob_id, &vec![6; page_size], 6 * PAGE_SIZE_U64);
         assert!(!cached(2));
         assert!((3..7).all(cached));
-        assert!(cache_ref.cache.read().retired.is_empty());
+        assert!(cache_ref.cache.read().retired.ranges.is_empty());
     }
 
     #[test_traced]
@@ -1066,7 +1107,7 @@ mod tests {
         // A boundary advanced in steps retires contiguous ranges, which coalesce so the queue
         // stays one entry per blob. Ranges of another blob, or with a gap, start new entries.
         let pool = test_pool();
-        let cache_ref = CacheRef::new(pool, PAGE_SIZE, NZUsize!(4));
+        let cache_ref = CacheRef::new(pool, PAGE_SIZE, NZUsize!(16));
         let (first, second) = (cache_ref.next_id(), cache_ref.next_id());
         let size = 16 * PAGE_SIZE_U64;
 
@@ -1078,9 +1119,68 @@ mod tests {
         // A range that completes no page retires nothing.
         cache_ref.retire(second, PAGE_SIZE_U64..PAGE_SIZE_U64 + 1, size);
         assert_eq!(
-            cache_ref.cache.read().retired,
+            cache_ref.cache.read().retired.ranges,
             [(first, 0..5), (second, 0..1), (first, 7..8)]
         );
+    }
+
+    #[test_traced]
+    fn test_retire_inspects_at_most_max_probes_pages_per_insertion() {
+        // An insertion gives up after MAX_RETIRED_PROBES absent retired pages, even when the
+        // next one is resident: that page keeps its slot until a later insertion reaches it.
+        let pool = test_pool();
+        let cache_ref = CacheRef::new(pool, PAGE_SIZE, NZUsize!(16));
+        let blob_id = cache_ref.next_id();
+        let page_size = PAGE_SIZE.get() as usize;
+        let cached = |page: u64| {
+            let mut buf = vec![0u8; page_size];
+            cache_ref.read_cached(blob_id, &mut buf, page * PAGE_SIZE_U64) == page_size
+        };
+
+        // Retire one page past the probe bound, of which only the last is resident.
+        let probes = MAX_RETIRED_PROBES as u64;
+        cache_ref.cache(blob_id, &vec![1; page_size], probes * PAGE_SIZE_U64);
+        cache_ref.retire(blob_id, 0..(probes + 1) * PAGE_SIZE_U64, 32 * PAGE_SIZE_U64);
+
+        // The first insertion inspects only the absent pages and takes a free slot.
+        cache_ref.cache(blob_id, &vec![2; page_size], 20 * PAGE_SIZE_U64);
+        assert!(cached(probes));
+        assert!(cached(20));
+        assert_eq!(
+            cache_ref.cache.read().retired.ranges,
+            [(blob_id, probes..probes + 1)]
+        );
+
+        // The next insertion reaches the resident retired page and takes its slot.
+        cache_ref.cache(blob_id, &vec![3; page_size], 21 * PAGE_SIZE_U64);
+        assert!(!cached(probes));
+        assert!(cached(20) && cached(21));
+        assert!(cache_ref.cache.read().retired.ranges.is_empty());
+    }
+
+    #[test_traced]
+    fn test_retire_queues_at_most_the_cache_capacity() {
+        // No more retired pages than the cache holds can be resident, so retiring beyond its
+        // capacity drops the oldest queued pages, across ranges and blobs.
+        let pool = test_pool();
+        let cache_ref = CacheRef::new(pool, PAGE_SIZE, NZUsize!(4));
+        let (first, second) = (cache_ref.next_id(), cache_ref.next_id());
+        let size = 16 * PAGE_SIZE_U64;
+
+        cache_ref.retire(first, 0..10 * PAGE_SIZE_U64, size);
+        assert_eq!(cache_ref.cache.read().retired.ranges, [(first, 6..10)]);
+        cache_ref.retire(second, 0..2 * PAGE_SIZE_U64, size);
+        {
+            let cache = cache_ref.cache.read();
+            assert_eq!(cache.retired.ranges, [(first, 8..10), (second, 0..2)]);
+            assert_eq!(cache.retired.pages, 4);
+        }
+        cache_ref.retire(second, 2 * PAGE_SIZE_U64..5 * PAGE_SIZE_U64, size);
+        {
+            let cache = cache_ref.cache.read();
+            assert_eq!(cache.retired.ranges, [(second, 1..5)]);
+            assert_eq!(cache.retired.pages, 4);
+        }
     }
 
     #[test_traced]
